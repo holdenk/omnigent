@@ -1684,6 +1684,8 @@ def _build_pi_spawn_env(
     bound = binding_for_harness(load_runtime_inference_config(), "pi") is not None
     if bound:
         env["HARNESS_PI_PRESERVE_MODEL_IDS"] = "true"
+        # The executor keeps the managed provider for every model, extension models included.
+        env["HARNESS_PI_INFERENCE_BOUND"] = "true"
     if model is not None:
         env["HARNESS_PI_MODEL"] = model
 

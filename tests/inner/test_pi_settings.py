@@ -175,6 +175,33 @@ def test_user_pi_state_is_linked_writable_and_never_clobbers_managed_files(
     assert not (managed / "lunaroute.json").is_symlink()
 
 
+@pytest.mark.parametrize(
+    ("existing", "user_file_exists", "linked"),
+    [("{}", True, True), ("", True, True), ("{}", False, False), ('{"x": {}}', True, False)],
+    ids=["pi-placeholder", "empty-file", "no-user-file", "real-content"],
+)
+def test_reused_dir_replaces_only_pi_placeholder_state(
+    tmp_path: Path, existing: str, user_file_exists: bool, linked: bool
+) -> None:
+    """Pi writes ``{}`` for missing state; a later user login must not stay shadowed."""
+    global_agent = tmp_path / "global-agent"
+    global_agent.mkdir()
+    if user_file_exists:
+        (global_agent / "auth.json").write_text('{"example": {}}', encoding="utf-8")
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "auth.json").write_text(existing, encoding="utf-8")
+
+    prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
+
+    target = managed / "auth.json"
+    assert target.is_symlink() is linked
+    if linked:
+        assert target.readlink() == global_agent / "auth.json"
+    else:
+        assert target.read_text(encoding="utf-8") == existing
+
+
 def test_prepare_managed_pi_agent_dir_replaces_stale_links_on_reuse(tmp_path: Path) -> None:
     """A resumed session drops links to a previous root or removed sources."""
     previous_root = tmp_path / "previous-agent"

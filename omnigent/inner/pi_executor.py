@@ -2188,6 +2188,7 @@ class PiExecutor(Executor):
         context_files: bool = True,
         system_prompt_mode: str = "append",
         preserve_model_ids: bool = False,
+        inference_bound: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
@@ -2197,6 +2198,8 @@ class PiExecutor(Executor):
             Explicit agent instructions are unaffected.
         :param system_prompt_mode: ``append`` retains Pi's base prompt;
             ``replace`` uses Omnigent's composed instructions as the base.
+        :param inference_bound: An inference binding requires the managed
+            gateway provider for every model, including Pi-extension models.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
@@ -2275,6 +2278,7 @@ class PiExecutor(Executor):
         self._model_override = model
         self._preserve_model_ids = preserve_model_ids
         self._gateway = gateway
+        self._inference_bound = inference_bound
         self._databricks_profile = databricks_profile
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
         self._base_url_override = base_url_override
@@ -2542,9 +2546,12 @@ class PiExecutor(Executor):
         """Return whether a turn on *model* routes through the gateway providers.
 
         A Pi-extension model (``lunaroute/<id>``) runs on the user's own Pi
-        configuration, so it skips the gateway even when one is configured.
+        configuration, so it skips the gateway even when one is configured,
+        unless an inference binding requires the managed provider.
         """
-        return self._gateway and not is_pi_extension_provider_model(model)
+        if not self._gateway:
+            return False
+        return self._inference_bound or not is_pi_extension_provider_model(model)
 
     def _generic_openai_wire_api(self) -> str | None:
         """Return the configured wire only for a non-Databricks gateway."""

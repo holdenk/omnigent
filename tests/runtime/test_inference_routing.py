@@ -216,6 +216,43 @@ async def test_bound_pi_sdk_preserves_literal_suffix_through_executor_factory(
     assert env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] == "responses"
 
 
+def test_bound_pi_sdk_keeps_managed_provider_for_pi_extension_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A binding without an allowlist still routes ``lunaroute/<id>`` through its provider."""
+    from omnigent.inner.pi_executor import PiExecutor
+    from omnigent.inner.pi_harness import _build_pi_executor
+    from omnigent.runtime.workflow import _build_pi_spawn_env
+
+    model = "lunaroute/glm-5.3-flash"
+    profile = _profile()
+    profile["inference"] = {"harnesses": {"pi": {"provider": "bifrost"}}}
+    with inference_config_scope(profile):
+        env = _build_pi_spawn_env(_spec("pi", model))
+    assert env["HARNESS_PI_MODEL"] == model
+    assert env["HARNESS_PI_GATEWAY"] == "true"
+    assert env["HARNESS_PI_INFERENCE_BOUND"] == "true"
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr("omnigent.inner.pi_harness.resolve_harness_path", lambda _: "/fake/pi")
+    monkeypatch.setattr("omnigent.inner.pi_executor._fetch_shell_command_token", lambda _: "token")
+    executor = _build_pi_executor()
+    assert isinstance(executor, PiExecutor)
+    assert executor._uses_gateway(model)
+
+
+def test_bound_pi_native_keeps_managed_provider_for_pi_extension_model() -> None:
+    """A pi-native binding is not bypassed by a ``lunaroute/<id>`` selection."""
+    model = "lunaroute/glm-5.3-flash"
+    profile = _profile()
+    profile["inference"] = {"harnesses": {"pi-native": {"provider": "bifrost"}}}
+    with inference_config_scope(profile):
+        provider = resolve_pi_native_provider(model=model)
+    assert provider is not None
+    assert provider.inference_bound
+    assert provider.model == model
+
+
 @pytest.mark.asyncio
 async def test_bound_claude_launch_never_falls_back_to_cli_login() -> None:
     from omnigent.runner.native.orchestration import _auto_create_claude_terminal

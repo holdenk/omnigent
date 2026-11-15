@@ -167,12 +167,16 @@ def is_pi_extension_provider_model(model: str | None) -> bool:
 
     :param model: Model selection, e.g. ``"lunaroute/glm-5.3-flash"``.
     :returns: ``True`` when the provider is in :data:`PI_EXTENSION_PROVIDER_IDS`
-        and a model id follows it.
+        and a non-blank model id without surrounding whitespace follows it.
     """
     if not model:
         return False
     provider_id, separator, model_id = model.partition("/")
-    return bool(separator and model_id) and provider_id in PI_EXTENSION_PROVIDER_IDS
+    return (
+        bool(separator and model_id.strip())
+        and model_id == model_id.strip()
+        and provider_id in PI_EXTENSION_PROVIDER_IDS
+    )
 
 
 class _PiProviderCompat(TypedDict, total=False):

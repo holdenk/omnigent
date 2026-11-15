@@ -896,24 +896,32 @@ def test_ensure_rpc_launch_selector_matches_registration(base_urls, model, expec
 
 
 @pytest.mark.parametrize(
-    ("model", "expected_selector", "uses_gateway"),
+    ("model", "inference_bound", "expected_selector", "uses_gateway"),
     [
-        ("lunaroute/glm-5.3-flash", "lunaroute/glm-5.3-flash", False),
-        ("databricks-gpt-5-5", "databricks-openai/databricks-gpt-5-5", True),
+        ("lunaroute/glm-5.3-flash", False, "lunaroute/glm-5.3-flash", False),
+        (
+            "lunaroute/glm-5.3-flash",
+            True,
+            "databricks-completions/lunaroute/glm-5.3-flash",
+            True,
+        ),
+        ("databricks-gpt-5-5", False, "databricks-openai/databricks-gpt-5-5", True),
     ],
-    ids=["pi-extension-model", "gateway-model"],
+    ids=["pi-extension-model", "bound-pi-extension-model", "gateway-model"],
 )
 def test_ensure_rpc_passes_pi_extension_models_through(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     model: str,
+    inference_bound: bool,
     expected_selector: str,
     uses_gateway: bool,
 ) -> None:
     """A gateway executor launches ``lunaroute/<id>`` on Pi's own config, unprefixed.
 
-    Drives the real ``_ensure_rpc`` and ``_build_env_and_dir`` with only the
-    subprocess spawn and tool server stubbed.
+    An inference binding keeps every model, extension models included, on the
+    gateway. Drives the real ``_ensure_rpc`` and ``_build_env_and_dir`` with
+    only the subprocess spawn and tool server stubbed.
     """
     user_agent_dir = tmp_path / "user-pi-agent"
     user_agent_dir.mkdir()
@@ -929,6 +937,7 @@ def test_ensure_rpc_passes_pi_extension_models_through(
             gateway_host=host,
             base_urls_override={"claude": f"{host}/ai-gateway/anthropic"},
             gateway_auth_command="printf tok",
+            inference_bound=inference_bound,
         )
     executor._tool_server = SimpleNamespace(token="bridge-token")
     seen: dict[str, object] = {}
@@ -947,35 +956,38 @@ def test_ensure_rpc_passes_pi_extension_models_through(
             return await executor._ensure_rpc("session", "system", model, [])
 
     rpc = _run(_test())
+    tmp_dir = rpc._tmp_dir
+    assert tmp_dir is not None
     try:
         assert seen["model"] == expected_selector
         env = seen["env"]
         assert isinstance(env, dict)
         managed_dir = env.get("PI_CODING_AGENT_DIR")
         if uses_gateway:
-            assert managed_dir == rpc._tmp_dir
-            assert (Path(rpc._tmp_dir) / "models.json").exists()
+            assert managed_dir == tmp_dir
+            assert (Path(tmp_dir) / "models.json").exists()
             load_wire_apis.assert_awaited_once()
         else:
             # Pi keeps the user's own agent dir: settings, logins and extensions.
             assert managed_dir == str(user_agent_dir)
-            assert not (Path(rpc._tmp_dir) / "models.json").exists()
+            assert not (Path(tmp_dir) / "models.json").exists()
             load_wire_apis.assert_not_awaited()
     finally:
-        shutil.rmtree(rpc._tmp_dir, ignore_errors=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @pytest.mark.parametrize(
-    ("model", "expected_error"),
+    ("model", "inference_bound", "expected_error"),
     [
-        ("lunaroute/glm-5.3-flash", "Failed to start Pi: spawn stub"),
-        ("databricks-gpt-5-5", "gateway unavailable"),
+        ("lunaroute/glm-5.3-flash", False, "Failed to start Pi: spawn stub"),
+        ("lunaroute/glm-5.3-flash", True, "gateway unavailable"),
+        ("databricks-gpt-5-5", False, "gateway unavailable"),
     ],
 )
 def test_run_turn_skips_gateway_auth_for_pi_extension_models(
-    model: str, expected_error: str
+    model: str, inference_bound: bool, expected_error: str
 ) -> None:
-    """Only gateway-routed turns need the gateway credential."""
+    """Only gateway-routed turns need the gateway credential; a binding routes them all."""
     host = "https://workspace.example.com"
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
@@ -986,6 +998,7 @@ def test_run_turn_skips_gateway_auth_for_pi_extension_models(
             gateway_host=host,
             base_urls_override={"claude": f"{host}/ai-gateway/anthropic"},
             gateway_auth_command="printf tok",
+            inference_bound=inference_bound,
         )
 
     async def _test():

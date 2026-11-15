@@ -26,7 +26,12 @@ _PI_RESOURCE_TYPES = ("extensions", "skills", "prompts", "themes")
 PI_CONTEXT_FILE_NAMES = ("AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
 # User Pi state linked (never copied) so ``/login`` and OAuth refreshes persist:
 # provider logins, Pi's cached model catalogs, and Pi-extension settings files.
+# ``auth.json`` is linked so extension providers find their key; gateway launches
+# still pin an explicit managed ``--model``, so a linked login never selects the model.
 PI_USER_STATE_FILE_NAMES = ("auth.json", "models-store.json", "lunaroute.json")
+# Pi creates a missing ``auth.json`` / ``models-store.json`` as ``{}`` on first read.
+_PI_PLACEHOLDER_CONTENTS = frozenset({"", "{}"})
+_PI_PLACEHOLDER_MAX_BYTES = 16
 _PI_AGENT_RESOURCES = (
     *_PI_RESOURCE_TYPES,
     *PI_USER_STATE_FILE_NAMES,
@@ -106,6 +111,16 @@ def _relocate_resource_settings(
     return settings
 
 
+def _is_pi_placeholder(target: Path) -> bool:
+    """Return whether *target* is the empty file Pi creates for missing user state."""
+    try:
+        if not target.is_file() or target.stat().st_size > _PI_PLACEHOLDER_MAX_BYTES:
+            return False
+        return target.read_text(encoding="utf-8").strip() in _PI_PLACEHOLDER_CONTENTS
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def _symlink_agent_resources(
     managed_dir: Path,
     global_agent_dir: Path,
@@ -122,7 +137,15 @@ def _symlink_agent_resources(
                     continue
                 target.unlink()
             elif target.exists():
-                continue
+                # A reused dir may hold Pi's placeholder from a launch before the user's
+                # file existed; replace only that, never a file with real content.
+                if not (
+                    name in PI_USER_STATE_FILE_NAMES
+                    and source.exists()
+                    and _is_pi_placeholder(target)
+                ):
+                    continue
+                target.unlink()
             if source.exists():
                 target.symlink_to(source, target_is_directory=source.is_dir())
         except OSError as exc:

@@ -870,6 +870,10 @@ def test_resolve_prefers_pi_own_login_for_served_reference(
     [
         ("lunaroute/glm-5.3-flash", True),
         ("lunaroute/", False),
+        ("lunaroute/   ", False),
+        ("lunaroute/ glm-5.3-flash", False),
+        ("lunaroute/glm-5.3-flash ", False),
+        (" lunaroute/glm-5.3-flash", False),
         ("lunaroute", False),
         ("openai/gpt-4o-mini", False),
         ("omnigent/glm-5.3", False),

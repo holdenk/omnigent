@@ -271,9 +271,13 @@ there update your own files.
 A model qualified with a Pi-extension provider, `lunaroute/<model-id>`, runs on
 your own Pi configuration instead of an Omnigent-managed provider: `pi` and
 `pi-native` pass it to Pi as `--model lunaroute/<model-id>` without a managed
-`--provider` or model prefix. Other models keep the configured provider. An
-inference binding still requires its managed provider. `LUNAROUTE_*` environment
-variables reach the `pi` harness.
+`--provider` or model prefix. Other models keep the configured provider. When an
+inference binding is configured for the harness (`pi` or `pi-native`), every
+model, `lunaroute/<model-id>` included, is sent to the bound provider instead,
+and a binding with a model allowlist rejects a `lunaroute` model it does not list.
+`LUNAROUTE_*` environment variables reach both `pi` (through its environment
+allowlist) and `pi-native` (which inherits the runner environment, minus any
+names in `OMNIGENT_PI_ENV_UNSET`).
 
 To use LunaRoute, run `pi install npm:@lunaroute/pi-extension` and
 `/login lunaroute` in Pi once, then select a LunaRoute model:
