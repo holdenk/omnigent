@@ -491,6 +491,34 @@ def _read_json_object(path: Path) -> dict[str, object]:
     return raw if _is_str_object_dict(raw) else {}
 
 
+def pi_own_login_configured(agent_dir: Path | None = None) -> bool:
+    """Return whether Pi's own agent dir holds a credential Pi can run on.
+
+    That is a provider login in ``auth.json`` (Pi and Pi extensions such as
+    LunaRoute store one entry per provider) or a ``models.json`` custom
+    provider declaring its own ``apiKey`` — the same sources
+    :func:`pi_own_login_model_options` lists. Credential values are never
+    surfaced.
+
+    :param agent_dir: Pi agent dir override (tests); defaults to
+        :func:`global_pi_agent_dir`, which honours ``PI_CODING_AGENT_DIR``.
+    :returns: ``True`` when such a credential is present.
+    """
+    root = agent_dir if agent_dir is not None else global_pi_agent_dir()
+    if any(
+        _is_str_object_dict(entry) and bool(entry)
+        for entry in _read_json_object(root / "auth.json").values()
+    ):
+        return True
+    declared = _read_json_object(root / "models.json").get("providers")
+    return _is_str_object_dict(declared) and any(
+        _is_str_object_dict(payload)
+        and isinstance(payload.get("apiKey"), str)
+        and bool(payload.get("apiKey"))
+        for payload in declared.values()
+    )
+
+
 def _pi_enabled_model_patterns(root: Path) -> list[str]:
     """Read Pi's own model curation (``settings.json`` ``enabledModels``).
 
@@ -542,19 +570,27 @@ def _pi_own_login_models(root: Path) -> list[ScopableModel]:
     return list(catalog.values())
 
 
-def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, object]]:
+def pi_own_login_model_options(
+    agent_dir: Path | None = None, *, provider_id: str | None = None
+) -> list[dict[str, object]]:
     """List logged-in and keyed custom models with Pi's enabledModels curation.
 
     Use the full inventory when curation is empty or unavailable.
 
     :param agent_dir: Pi agent dir override (tests); defaults to the host's
         own Pi agent dir.
+    :param provider_id: Restrict the inventory to one Pi provider, e.g.
+        ``"lunaroute"``; ``None`` keeps every logged-in provider.
     :returns: Picker options shaped like :func:`pi_native_model_options`,
         qualified as ``provider/model`` — the reference form Pi's ``--model``
         resolves natively against its own providers.
     """
     root = agent_dir if agent_dir is not None else global_pi_agent_dir()
-    entries = _pi_own_login_models(root)
+    entries = [
+        entry
+        for entry in _pi_own_login_models(root)
+        if provider_id is None or entry.provider == provider_id
+    ]
     patterns = _pi_enabled_model_patterns(root)
     if patterns:
         scoped = scope_models(patterns, entries)

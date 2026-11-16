@@ -1128,7 +1128,10 @@ def list_models_for_worker(
                 note="Configured ACP provider model shortlist; vendor CLI owns authentication.",
             )
     provider = resolve_model_provider(spec, harness)
-    if provider.kind == DATABRICKS_KIND:
+    own_login_listing = _pi_own_login_listing(spec, harness, provider)
+    if own_login_listing is not None:
+        listing = own_login_listing
+    elif provider.kind == DATABRICKS_KIND:
         uc_key = ("uc", *_listing_cache_key(provider))
         with _listing_cache_lock:
             uc_listing = cast(ModelListing | None, _listing_cache.get(uc_key))
@@ -1506,6 +1509,68 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
         note=(
             f"{provider.detail} enumerates its models only from the CLI's own "
             "config at launch; the live listing comes from probing the harness"
+        ),
+    )
+
+
+def _pi_own_login_listing(
+    spec: object, harness: str | None, provider: ResolvedModelProvider
+) -> ModelListing | None:
+    """List the models a pi worker running on Pi's own agent dir can use.
+
+    pi and pi-native fall back to Pi's own login when no Omnigent provider is
+    configured, and a Pi-extension model (``lunaroute/<id>``) runs on it even
+    when one is, unless an inference binding forces the managed provider.
+
+    :param spec: The worker's (sub-)agent spec.
+    :param harness: The worker's harness id, e.g. ``"pi"``.
+    :param provider: The worker's resolved Omnigent provider.
+    :returns: A listing of Pi's own ``provider/model`` references (only the
+        extension provider's for an extension-model worker), or ``None`` when
+        the worker routes elsewhere or Pi's agent dir holds no login.
+    """
+    if (
+        harness is None
+        or _PROVIDER_RESOLUTION_HARNESS.get(canonicalize_harness(harness) or harness) != "pi"
+    ):
+        return None
+    from omnigent.harnesses.pi_native.credentials import (
+        is_pi_extension_provider_model,
+        pi_own_login_configured,
+        pi_own_login_model_options,
+    )
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    if binding_for_harness(load_runtime_inference_config(), harness) is not None:
+        return None
+    spec_model = getattr(getattr(spec, "executor", None), "model", None)
+    extension_provider = (
+        spec_model.partition("/")[0]
+        if isinstance(spec_model, str) and is_pi_extension_provider_model(spec_model)
+        else None
+    )
+    # A resolution failure is not "unconfigured"; keep reporting it as such.
+    unconfigured = provider.kind == NONE_KIND and provider.detail == "no model provider configured"
+    if (extension_provider is None and not unconfigured) or not pi_own_login_configured():
+        return None
+    model_ids = [
+        str(option["id"]) for option in pi_own_login_model_options(provider_id=extension_provider)
+    ]
+    scope = f"Pi's {extension_provider} extension" if extension_provider else "Pi's own login"
+    return ModelListing(
+        source="static",
+        verified=False,
+        models=tuple(
+            ModelEntry(id=model_id, family=model_family_token(model_id)) for model_id in model_ids
+        ),
+        note=(
+            f"runs on {scope} in its agent dir (no Omnigent provider), so dispatches to this "
+            "worker can run here; "
+            + (
+                "ids are read from Pi's cached model catalog"
+                if model_ids
+                else "Pi has cached no model catalog for it yet, so omit args.model"
+            )
         ),
     )
 

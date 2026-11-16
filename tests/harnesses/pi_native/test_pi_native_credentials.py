@@ -3952,6 +3952,58 @@ def test_pi_own_login_options_empty_without_login(tmp_path: Path) -> None:
     assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
 
 
+@pytest.mark.parametrize(
+    ("auth_json", "models_json", "expected"),
+    [
+        (None, None, False),
+        ({}, None, False),
+        ({"lunaroute": {}}, None, False),
+        ({"lunaroute": {"type": "api_key"}}, None, True),
+        (None, {"providers": {"local": {"models": []}}}, False),
+        (None, {"providers": {"local": {"apiKey": "local-key", "models": []}}}, True),
+    ],
+)
+def test_pi_own_login_configured(
+    tmp_path: Path,
+    auth_json: dict[str, object] | None,
+    models_json: dict[str, object] | None,
+    expected: bool,
+) -> None:
+    """A Pi login is a non-empty ``auth.json`` entry or a keyed ``models.json`` provider."""
+    if auth_json is not None:
+        (tmp_path / "auth.json").write_text(json.dumps(auth_json))
+    if models_json is not None:
+        (tmp_path / "models.json").write_text(json.dumps(models_json))
+    assert creds.pi_own_login_configured(agent_dir=tmp_path) is expected
+
+
+def test_pi_own_login_configured_honours_agent_dir_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without an explicit dir, ``PI_CODING_AGENT_DIR`` selects the Pi login read."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, raising=False)
+    assert creds.pi_own_login_configured() is False
+    _seed_pi_own_login(tmp_path / "custom")
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(tmp_path / "custom"))
+    assert creds.pi_own_login_configured() is True
+
+
+def test_pi_own_login_options_filter_by_provider(tmp_path: Path) -> None:
+    """``provider_id`` limits the catalog to one Pi provider, e.g. an extension."""
+    _seed_pi_own_login(tmp_path)
+    (tmp_path / "auth.json").write_text(
+        json.dumps({"anthropic": {"type": "api_key"}, "lunaroute": {"type": "api_key"}})
+    )
+    store = json.loads((tmp_path / "models-store.json").read_text())
+    store["lunaroute"] = {"models": [{"id": "glm-5.3-flash"}, {"id": "glm-5.3"}]}
+    (tmp_path / "models-store.json").write_text(json.dumps(store))
+
+    options = creds.pi_own_login_model_options(agent_dir=tmp_path, provider_id="lunaroute")
+
+    assert [option["id"] for option in options] == ["lunaroute/glm-5.3", "lunaroute/glm-5.3-flash"]
+
+
 def test_pi_own_login_options_include_models_json_custom_providers(tmp_path: Path) -> None:
     """Include keyed custom models even without auth.json or models-store.json entries."""
     _seed_pi_own_login(tmp_path)

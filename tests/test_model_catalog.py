@@ -3268,3 +3268,84 @@ def test_acp_provider_resolution_failure_does_not_become_empty_catalog(
     unbound = _worker_spec("acp:custom")
     assert model_catalog.acp_curated_models(unbound) == ()
     model_catalog.validate_acp_model(unbound, "another-model")
+
+
+def _seed_pi_agent_dir(agent_dir: Path, *, logged_in: bool) -> None:
+    """Seed a Pi agent dir with a LunaRoute and an OpenRouter model catalog.
+
+    :param agent_dir: The Pi agent dir (``PI_CODING_AGENT_DIR``) to populate.
+    :param logged_in: Whether ``auth.json`` holds logins for both providers.
+    """
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    auth = {"lunaroute": {"type": "api_key"}, "openrouter": {"type": "api_key"}}
+    (agent_dir / "auth.json").write_text(json.dumps(auth if logged_in else {}))
+    (agent_dir / "models-store.json").write_text(
+        json.dumps(
+            {
+                "lunaroute": {"models": [{"id": "glm-5.3-flash"}, {"id": "glm-5.3"}]},
+                "openrouter": {"models": [{"id": "vendor/model-a"}]},
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize("harness", ["pi", "pi-native", "native-pi"])
+def test_pi_worker_without_provider_lists_pi_own_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """With no Omnigent provider, a pi worker runs on Pi's own login and lists it.
+
+    Reporting ``none`` there would tell orchestrators the worker cannot run,
+    although pi launches on the agent dir's login.
+    """
+    _isolate_config(monkeypatch, tmp_path, "")
+    _seed_pi_agent_dir(tmp_path / "pi-agent", logged_in=True)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi-agent"))
+
+    listing = list_models_for_worker(_worker_spec(harness), harness)
+
+    assert listing.source == "static"
+    assert [model.id for model in listing.models] == [
+        "lunaroute/glm-5.3",
+        "lunaroute/glm-5.3-flash",
+        "openrouter/vendor/model-a",
+    ]
+    assert "can run here" in listing.note
+    assert "cannot run" not in listing.note
+
+
+def test_pi_extension_worker_lists_only_extension_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``lunaroute/<id>`` worker lists LunaRoute's models even beside a gateway provider.
+
+    The spawn path keeps an extension model on Pi's own configuration, so the
+    configured gateway's catalog is not what this worker runs.
+    """
+    _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
+    _seed_pi_agent_dir(tmp_path / "pi-agent", logged_in=True)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi-agent"))
+    spec = _worker_spec("pi", model="lunaroute/glm-5.3-flash")
+
+    listing = list_models_for_worker(spec, "pi")
+
+    assert [model.id for model in listing.models] == [
+        "lunaroute/glm-5.3",
+        "lunaroute/glm-5.3-flash",
+    ]
+    assert "lunaroute" in listing.note
+
+
+def test_pi_worker_without_provider_or_pi_login_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No Omnigent provider and no Pi login keeps the ``none`` row."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _seed_pi_agent_dir(tmp_path / "pi-agent", logged_in=False)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi-agent"))
+
+    listing = list_models_for_worker(_worker_spec("pi", model="lunaroute/glm-5.3-flash"), "pi")
+
+    assert listing.source == "none"
+    assert listing.models == ()
+    assert "cannot run here" in listing.note
