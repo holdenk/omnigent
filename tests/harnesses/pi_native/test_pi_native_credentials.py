@@ -3977,6 +3977,48 @@ def test_pi_own_login_configured(
     assert creds.pi_own_login_configured(agent_dir=tmp_path) is expected
 
 
+@pytest.mark.parametrize(
+    ("api_key", "env_value", "expected"),
+    [
+        ("$PI_TEST_PROVIDER_KEY", None, False),
+        ("$PI_TEST_PROVIDER_KEY", "", False),
+        ("$PI_TEST_PROVIDER_KEY", "set", True),
+        ("${PI_TEST_PROVIDER_KEY}", None, False),
+        ("${PI_TEST_PROVIDER_KEY}", "set", True),
+        ("prefix-${PI_TEST_PROVIDER_KEY}", None, False),
+        ("literal-key", None, True),
+        ("$$escaped-literal", None, True),
+        ("!print-key-command", None, True),
+    ],
+)
+def test_pi_own_login_models_json_api_key_resolves_like_pi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api_key: str,
+    env_value: str | None,
+    expected: bool,
+) -> None:
+    """A models.json ``apiKey`` counts only when Pi could resolve it.
+
+    An unset or empty ``$VAR`` / ``${VAR}`` reference is no credential, so the
+    provider neither readies pi nor lists its models; a ``!command`` counts
+    without being run, as in Pi.
+    """
+    if env_value is None:
+        monkeypatch.delenv("PI_TEST_PROVIDER_KEY", raising=False)
+    else:
+        monkeypatch.setenv("PI_TEST_PROVIDER_KEY", env_value)
+    (tmp_path / "models.json").write_text(
+        json.dumps(
+            {"providers": {"custom": {"apiKey": api_key, "models": [{"id": "custom-model"}]}}}
+        )
+    )
+
+    assert creds.pi_own_login_configured(agent_dir=tmp_path) is expected
+    listed = [option["id"] for option in creds.pi_own_login_model_options(agent_dir=tmp_path)]
+    assert listed == (["custom/custom-model"] if expected else [])
+
+
 def test_pi_own_login_configured_honours_agent_dir_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -491,12 +491,66 @@ def _read_json_object(path: Path) -> dict[str, object]:
     return raw if _is_str_object_dict(raw) else {}
 
 
+_PI_ENV_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _pi_config_value_env_names(value: str) -> list[str]:
+    """Return the env var names a Pi config value (e.g. an ``apiKey``) interpolates.
+
+    Mirrors Pi's ``parseConfigValueTemplate``: ``$NAME`` and ``${NAME}`` are
+    references, ``$$`` / ``$!`` are escapes, and anything else is literal.
+    """
+    names: list[str] = []
+    index = 0
+    while (dollar := value.find("$", index)) >= 0:
+        next_char = value[dollar + 1 : dollar + 2]
+        if next_char in ("$", "!"):
+            index = dollar + 2
+            continue
+        if next_char == "{":
+            end = value.find("}", dollar + 2)
+            if end < 0:
+                index = dollar + 1
+                continue
+            name = value[dollar + 2 : end]
+            if _PI_ENV_VAR_NAME_RE.fullmatch(name):
+                names.append(name)
+            index = end + 1
+            continue
+        match = _PI_ENV_VAR_NAME_RE.match(value, dollar + 1)
+        if match is not None:
+            names.append(match.group())
+            index = match.end()
+            continue
+        index = dollar + 1
+    return names
+
+
+def _pi_config_value_configured(value: object, env: Mapping[str, str] | None = None) -> bool:
+    """Return whether Pi would treat a ``models.json`` ``apiKey`` as configured.
+
+    Mirrors Pi's ``configuredRequestAuthStatus``: a ``!command`` counts without
+    being run, and a ``$VAR`` / ``${VAR}`` template needs every referenced
+    variable set and non-empty. Only presence is checked; no value is returned.
+
+    :param value: The raw ``apiKey`` value, e.g. ``"$PROVIDER_API_KEY"``.
+    :param env: Environment to consult; defaults to ``os.environ``.
+    :returns: ``True`` for a usable literal, command, or fully-set template.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if value.startswith("!"):
+        return True
+    source_env = os.environ if env is None else env
+    return all(source_env.get(name) for name in _pi_config_value_env_names(value))
+
+
 def pi_own_login_configured(agent_dir: Path | None = None) -> bool:
     """Return whether Pi's own agent dir holds a credential Pi can run on.
 
     That is a provider login in ``auth.json`` (Pi and Pi extensions such as
     LunaRoute store one entry per provider) or a ``models.json`` custom
-    provider declaring its own ``apiKey`` — the same sources
+    provider whose ``apiKey`` Pi can resolve — the same sources
     :func:`pi_own_login_model_options` lists. Credential values are never
     surfaced.
 
@@ -505,6 +559,7 @@ def pi_own_login_configured(agent_dir: Path | None = None) -> bool:
     :returns: ``True`` when such a credential is present.
     """
     root = agent_dir if agent_dir is not None else global_pi_agent_dir()
+    # Pi counts a stored auth.json credential without resolving its env refs.
     if any(
         _is_str_object_dict(entry) and bool(entry)
         for entry in _read_json_object(root / "auth.json").values()
@@ -512,9 +567,7 @@ def pi_own_login_configured(agent_dir: Path | None = None) -> bool:
         return True
     declared = _read_json_object(root / "models.json").get("providers")
     return _is_str_object_dict(declared) and any(
-        _is_str_object_dict(payload)
-        and isinstance(payload.get("apiKey"), str)
-        and bool(payload.get("apiKey"))
+        _is_str_object_dict(payload) and _pi_config_value_configured(payload.get("apiKey"))
         for payload in declared.values()
     )
 
@@ -542,7 +595,7 @@ def _pi_own_login_models(root: Path) -> list[ScopableModel]:
     declared = _read_json_object(root / "models.json").get("providers")
     for provider_id, payload in declared.items() if _is_str_object_dict(declared) else ():
         api_key = payload.get("apiKey") if _is_str_object_dict(payload) else None
-        if provider_id in logged_in or (isinstance(api_key, str) and api_key):
+        if provider_id in logged_in or _pi_config_value_configured(api_key):
             # Declared models follow the cache so their names win on duplicate references.
             catalogs.append((provider_id, payload))
     catalog: dict[str, ScopableModel] = {}

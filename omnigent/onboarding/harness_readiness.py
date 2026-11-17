@@ -1005,6 +1005,8 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
             pass
         from omnigent.harnesses.pi_native.credentials import pi_own_login_configured
 
+        # Host-level only: a per-spec ``executor.auth`` subscription fallback is
+        # not visible here, so such a worker may still run while this says needs-auth.
         return True if pi_own_login_configured() else "needs-auth"
     if canonical in _SDK_HARNESSES:
         return _sdk_harness_availability(canonical)
