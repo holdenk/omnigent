@@ -3370,9 +3370,21 @@ def _stub_cli_readiness(
     monkeypatch.setattr(kimi_auth, "kimi_auth_configured", lambda: kimi_logged_in)
 
 
+_OWN_LOGIN_MEMBERS = sorted(model_catalog._OWN_LOGIN_CLI_HARNESSES)
+
+
+@pytest.mark.parametrize("harness", _OWN_LOGIN_MEMBERS)
+def test_own_login_cli_harnesses_are_canonical_harness_ids(harness: str) -> None:
+    """Each member is a valid harness that canonicalizes into the set, so a rename fails here."""
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harness_plugins import valid_harnesses
+
+    assert canonicalize_harness(harness) in model_catalog._OWN_LOGIN_CLI_HARNESSES
+    assert harness in valid_harnesses()
+
+
 @pytest.mark.parametrize(
-    "harness",
-    ["kimi", "kimi-code", "kimi-native", "hermes-native", "opencode-native", "qwen-native"],
+    "harness", [*_OWN_LOGIN_MEMBERS, "kimi-code", "native-kimi", "opencode", "qwen-code"]
 )
 def test_own_login_cli_worker_without_provider_lists_pinned_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
@@ -3405,7 +3417,7 @@ def test_own_login_cli_worker_without_pinned_model_lists_nothing(
     assert "can still run" in str(row["note"])
 
 
-@pytest.mark.parametrize("harness", ["kimi", "hermes-native", "opencode-native"])
+@pytest.mark.parametrize("harness", _OWN_LOGIN_MEMBERS)
 def test_own_login_cli_worker_with_missing_binary_cannot_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
 ) -> None:
@@ -3431,3 +3443,93 @@ def test_kimi_worker_without_kimi_login_cannot_run(
 
     assert listing.source == "none"
     assert "cannot run here" in listing.note
+
+
+@pytest.mark.parametrize("harness", ["kimi", "qwen"])
+def test_own_login_cli_worker_with_rejected_spec_auth_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """Spec auth the spawn path rejects is a resolution failure, not an own-login worker."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _stub_cli_readiness(monkeypatch, installed=True)
+    spec = _worker_spec(harness, model="vendor-model-1", auth=DatabricksAuth(profile="p"))
+
+    listing = list_models_for_worker(spec, harness)
+
+    assert listing.source == "none"
+    assert "does not consume legacy auth" in listing.note
+    assert "cannot run here" in listing.note
+
+
+@pytest.mark.parametrize("harness", ["kimi", "qwen"])
+def test_own_login_cli_worker_with_failed_provider_resolution_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """A misconfigured provider that fails resolution keeps the dead-worker note."""
+    import omnigent.runtime.workflow as workflow
+
+    _isolate_config(monkeypatch, tmp_path, "")
+    _stub_cli_readiness(monkeypatch, installed=True)
+
+    def fail_resolution(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("provider misconfigured")
+
+    monkeypatch.setattr(workflow, "_resolve_provider_for_build", fail_resolution)
+
+    listing = list_models_for_worker(_worker_spec(harness, model="vendor-model-1"), harness)
+
+    assert listing.source == "none"
+    assert "provider resolution failed" in listing.note
+    assert "cannot run here" in listing.note
+
+
+def _stub_inference_binding(monkeypatch: pytest.MonkeyPatch, bound: list[str]) -> None:
+    """Bind every harness to a gateway provider, recording the names looked up.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param bound: Receives each harness name passed to ``binding_for_harness``.
+    """
+    import omnigent.inference_config as inference_config
+
+    def binding(_config: object, harness: str) -> inference_config.HarnessInferenceBinding:
+        bound.append(harness)
+        return inference_config.HarnessInferenceBinding(provider="gw")
+
+    monkeypatch.setattr(inference_config, "binding_for_harness", binding)
+
+
+@pytest.mark.parametrize(
+    ("harness", "canonical"), [("kimi", "kimi"), ("native-hermes", "hermes-native")]
+)
+def test_bound_own_login_cli_worker_skips_own_login_listing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str, canonical: str
+) -> None:
+    """An inference binding leaves the worker to the bound provider path."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _stub_cli_readiness(monkeypatch, installed=True)
+    spec = _worker_spec(harness, model="vendor-model-1")
+    unconfigured = model_catalog._UNCONFIGURED_PROVIDER
+    assert model_catalog._cli_own_login_listing(spec, harness, unconfigured) is not None
+
+    bound: list[str] = []
+    _stub_inference_binding(monkeypatch, bound)
+
+    assert model_catalog._cli_own_login_listing(spec, harness, unconfigured) is None
+    assert bound == [canonical]
+
+
+def test_bound_own_login_cli_worker_lists_through_provider_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bound hermes worker gets the provider-path row, not the own-login row."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _stub_cli_readiness(monkeypatch, installed=True)
+    _stub_inference_binding(monkeypatch, [])
+
+    listing = list_models_for_worker(
+        _worker_spec("hermes-native", model="vendor-model-1"), "hermes-native"
+    )
+
+    assert listing.source == "none"
+    assert listing.models == ()
+    assert "own stored login" not in listing.note

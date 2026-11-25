@@ -278,6 +278,10 @@ class ResolvedModelProvider:
     :param model_provider: Codex config.toml provider id for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
+    :param unconfigured: ``True`` only for a ``kind="none"`` result that
+        means no Omnigent provider applies (nothing configured, or a harness
+        with no provider resolution), never for a resolution failure or
+        rejected spec auth.
     """
 
     kind: str
@@ -289,6 +293,13 @@ class ResolvedModelProvider:
     cli: str | None = None
     model_provider: str | None = None
     detail: str = ""
+    unconfigured: bool = False
+
+
+# The genuine "nothing configured" fallback of every legacy resolution path.
+_UNCONFIGURED_PROVIDER = ResolvedModelProvider(
+    kind=NONE_KIND, detail="no model provider configured", unconfigured=True
+)
 
 
 def _model_configuration_host(base_url: str) -> str | None:
@@ -653,6 +664,7 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         return ResolvedModelProvider(
             kind=NONE_KIND,
             detail=f"harness {harness or 'unknown'!r} has no model-provider resolution",
+            unconfigured=True,
         )
 
     agent_spec = cast("AgentSpec", spec)
@@ -784,7 +796,7 @@ def _legacy_claude_sdk_provider(spec: AgentSpec) -> ResolvedModelProvider:
     prefix = _databricks_prefix_provider(spec)
     if prefix is not None:
         return prefix
-    return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
+    return _UNCONFIGURED_PROVIDER
 
 
 def _legacy_openai_agents_provider(spec: AgentSpec) -> ResolvedModelProvider:
@@ -826,7 +838,7 @@ def _legacy_openai_agents_provider(spec: AgentSpec) -> ResolvedModelProvider:
     prefix = _databricks_prefix_provider(spec)
     if prefix is not None:
         return prefix
-    return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
+    return _UNCONFIGURED_PROVIDER
 
 
 def _legacy_profile_only_provider(
@@ -858,7 +870,7 @@ def _legacy_profile_only_provider(
                 "fields; configure a 'providers:' entry instead"
             ),
         )
-    return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
+    return _UNCONFIGURED_PROVIDER
 
 
 def _legacy_acp_provider(spec: AgentSpec) -> ResolvedModelProvider:
@@ -880,7 +892,7 @@ def _legacy_acp_provider(spec: AgentSpec) -> ResolvedModelProvider:
                 "fields; configure a 'providers:' entry instead"
             ),
         )
-    return ResolvedModelProvider(kind=NONE_KIND, detail="no model provider configured")
+    return _UNCONFIGURED_PROVIDER
 
 
 def _acp_launch_model(spec: AgentSpec) -> str | None:
@@ -1569,7 +1581,7 @@ def _pi_own_login_listing(
         else None
     )
     # A resolution failure is not "unconfigured"; keep reporting it as such.
-    unconfigured = provider.kind == NONE_KIND and provider.detail == "no model provider configured"
+    unconfigured = provider.kind == NONE_KIND and provider.unconfigured
     if (extension_provider is None and not unconfigured) or not pi_own_login_configured():
         return None
     model_ids = [
@@ -1602,26 +1614,29 @@ def _cli_own_login_listing(
     kimi, hermes, opencode, qwen, goose and kiro launch their CLI on its own
     stored login, which exposes no model-listing API before launch. The
     worker can run unless the host's launch gate says the CLI is missing or
-    not ready.
+    not ready. That gate runs the CLI's ``--version`` probe, so each matching
+    worker row pays one probe subprocess.
 
     :param spec: The worker's (sub-)agent spec.
     :param harness: The worker's harness id, e.g. ``"kimi-native"``.
     :param provider: The worker's resolved Omnigent provider.
     :returns: A ``source="static"`` listing holding the spec's pinned model
         (if any), a ``source="none"`` listing when the CLI is not ready, or
-        ``None`` when the worker is not a provider-less own-login CLI worker.
+        ``None`` when the worker is not a provider-less own-login CLI worker
+        or an inference binding governs it.
     """
     canonical = canonicalize_harness(harness)
+    # A resolution failure or rejected spec auth is not unconfigured; keep reporting it.
     if (
         canonical is None
         or canonical not in _OWN_LOGIN_CLI_HARNESSES
         or provider.kind != NONE_KIND
+        or not provider.unconfigured
     ):
         return None
-    # A resolution failure or rejected spec auth is not "unconfigured"; keep reporting it.
-    if canonical in _PROVIDER_RESOLUTION_HARNESS and (
-        provider.detail != "no model provider configured"
-    ):
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    if binding_for_harness(load_runtime_inference_config(), canonical) is not None:
         return None
     from omnigent.onboarding.harness_readiness import harness_is_configured
 
