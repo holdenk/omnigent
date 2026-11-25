@@ -179,6 +179,23 @@ _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "nativ
 # provider-config lookup.
 _DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 
+# Canonical CLI harnesses that launch on the CLI's own stored login / config
+# when Omnigent resolves no provider for them, so "no provider" is not "cannot run".
+_OWN_LOGIN_CLI_HARNESSES: frozenset[str] = frozenset(
+    {
+        "kimi",
+        "kimi-native",
+        "hermes",
+        "hermes-native",
+        "opencode-native",
+        "qwen",
+        "qwen-native",
+        "goose",
+        "goose-native",
+        "kiro-native",
+    }
+)
+
 # SDK harnesses whose CLI-login launch shares a native model-probe catalog.
 _SDK_PROBE_CLI: dict[str, str] = {"claude-sdk": "claude", "claude_sdk": "claude", "codex": "codex"}
 
@@ -1128,7 +1145,9 @@ def list_models_for_worker(
                 note="Configured ACP provider model shortlist; vendor CLI owns authentication.",
             )
     provider = resolve_model_provider(spec, harness)
-    own_login_listing = _pi_own_login_listing(spec, harness, provider)
+    own_login_listing = _pi_own_login_listing(spec, harness, provider) or _cli_own_login_listing(
+        spec, harness, provider
+    )
     if own_login_listing is not None:
         listing = own_login_listing
     elif provider.kind == DATABRICKS_KIND:
@@ -1570,6 +1589,66 @@ def _pi_own_login_listing(
                 "ids are read from Pi's cached model catalog"
                 if model_ids
                 else "Pi has cached no model catalog for it yet, so omit args.model"
+            )
+        ),
+    )
+
+
+def _cli_own_login_listing(
+    spec: object, harness: str | None, provider: ResolvedModelProvider
+) -> ModelListing | None:
+    """List a CLI-login worker that Omnigent resolves no provider for.
+
+    kimi, hermes, opencode, qwen, goose and kiro launch their CLI on its own
+    stored login, which exposes no model-listing API before launch. The
+    worker can run unless the host's launch gate says the CLI is missing or
+    not ready.
+
+    :param spec: The worker's (sub-)agent spec.
+    :param harness: The worker's harness id, e.g. ``"kimi-native"``.
+    :param provider: The worker's resolved Omnigent provider.
+    :returns: A ``source="static"`` listing holding the spec's pinned model
+        (if any), a ``source="none"`` listing when the CLI is not ready, or
+        ``None`` when the worker is not a provider-less own-login CLI worker.
+    """
+    canonical = canonicalize_harness(harness)
+    if (
+        canonical is None
+        or canonical not in _OWN_LOGIN_CLI_HARNESSES
+        or provider.kind != NONE_KIND
+    ):
+        return None
+    # A resolution failure or rejected spec auth is not "unconfigured"; keep reporting it.
+    if canonical in _PROVIDER_RESOLUTION_HARNESS and (
+        provider.detail != "no model provider configured"
+    ):
+        return None
+    from omnigent.onboarding.harness_readiness import harness_is_configured
+
+    if not harness_is_configured(canonical):
+        return ModelListing(
+            source=NONE_KIND,
+            verified=False,
+            models=(),
+            note=(
+                f"the {canonical} CLI is missing or not ready on this host and no "
+                "Omnigent model provider is configured — dispatches to this worker "
+                "cannot run here"
+            ),
+        )
+    spec_model = getattr(getattr(spec, "executor", None), "model", None)
+    pinned = spec_model.strip() if isinstance(spec_model, str) else ""
+    return ModelListing(
+        source="static",
+        verified=False,
+        models=(ModelEntry(id=pinned, family=model_family_token(pinned)),) if pinned else (),
+        note=(
+            f"the {canonical} CLI launches with its own stored login, which exposes no "
+            "model-listing API before launch; dispatches to this worker can still run; "
+            + (
+                "the listed model is the spec's pinned executor.model"
+                if pinned
+                else "omit args.model to use the CLI's configured default"
             )
         ),
     )

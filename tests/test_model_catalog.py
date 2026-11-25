@@ -3349,3 +3349,85 @@ def test_pi_worker_without_provider_or_pi_login_cannot_run(
     assert listing.source == "none"
     assert listing.models == ()
     assert "cannot run here" in listing.note
+
+
+def _stub_cli_readiness(
+    monkeypatch: pytest.MonkeyPatch, *, installed: bool, kimi_logged_in: bool = True
+) -> None:
+    """Stub the launch gate's CLI binary and Kimi credential probes.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param installed: Whether every harness CLI binary reads as installed.
+    :param kimi_logged_in: Whether Kimi's stored login reads as configured.
+    """
+    import omnigent.onboarding.harness_readiness as harness_readiness
+    import omnigent.onboarding.kimi_auth as kimi_auth
+
+    monkeypatch.setattr(harness_readiness, "harness_cli_installed", lambda _key, **_kw: installed)
+    monkeypatch.setattr(
+        harness_readiness, "harness_cli_binary", lambda _key: "/usr/bin/cli" if installed else None
+    )
+    monkeypatch.setattr(kimi_auth, "kimi_auth_configured", lambda: kimi_logged_in)
+
+
+@pytest.mark.parametrize(
+    "harness",
+    ["kimi", "kimi-code", "kimi-native", "hermes-native", "opencode-native", "qwen-native"],
+)
+def test_own_login_cli_worker_without_provider_lists_pinned_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """A provider-less own-login CLI worker can run and lists its pinned model."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _stub_cli_readiness(monkeypatch, installed=True)
+
+    listing = list_models_for_worker(_worker_spec(harness, model="vendor-model-1"), harness)
+
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert [model.id for model in listing.models] == ["vendor-model-1"]
+    assert "own stored login" in listing.note
+    assert "can still run" in listing.note
+    assert "cannot run" not in listing.note
+
+
+def test_own_login_cli_worker_without_pinned_model_lists_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without a pinned model the row stays runnable with no listed ids."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _stub_cli_readiness(monkeypatch, installed=True)
+
+    row = catalog_for_spec(_worker_spec("hermes-native"))["self"]
+
+    assert row["source"] == "static"
+    assert row["models"] == []
+    assert "can still run" in str(row["note"])
+
+
+@pytest.mark.parametrize("harness", ["kimi", "hermes-native", "opencode-native"])
+def test_own_login_cli_worker_with_missing_binary_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    """A missing CLI binary keeps the dead-worker note."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _stub_cli_readiness(monkeypatch, installed=False)
+
+    listing = list_models_for_worker(_worker_spec(harness, model="vendor-model-1"), harness)
+
+    assert listing.source == "none"
+    assert listing.models == ()
+    assert "cannot run here" in listing.note
+
+
+def test_kimi_worker_without_kimi_login_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """kimi readiness also needs Kimi's stored login; without it the worker cannot run."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _stub_cli_readiness(monkeypatch, installed=True, kimi_logged_in=False)
+
+    listing = list_models_for_worker(_worker_spec("kimi", model="vendor-model-1"), "kimi")
+
+    assert listing.source == "none"
+    assert "cannot run here" in listing.note
