@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -84,3 +85,30 @@ def test_transport_failure_retry_uses_jitter(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(http_retry.random, "uniform", lambda low, high: high / 2)
 
     assert http_retry.jittered_retry_delay(None, backoff=2.0, max_delay=10.0) == 3.0
+
+
+@pytest.mark.parametrize(
+    ("retry_index", "window"),
+    [(0, 5.0), (1, 10.0), (3, 40.0), (5, 120.0), (10_000, 120.0), (-1, 5.0)],
+)
+def test_full_jitter_delay_spans_the_capped_exponential_window(
+    retry_index: int, window: float
+) -> None:
+    """Draws cover ``[0, min(cap, base * 2**retry_index)]``, even for huge indexes."""
+    bounds: list[tuple[float, float]] = []
+
+    class _RecordingRng(random.Random):
+        def uniform(self, a: float, b: float) -> float:
+            bounds.append((a, b))
+            return b
+
+    delay = http_retry.full_jitter_delay(retry_index, base=5.0, cap=120.0, rng=_RecordingRng())
+
+    assert delay == window
+    assert bounds == [(0.0, window)]
+    seeded = random.Random(42)
+    draws = [
+        http_retry.full_jitter_delay(retry_index, base=5.0, cap=120.0, rng=seeded)
+        for _ in range(50)
+    ]
+    assert all(0.0 <= draw <= window for draw in draws)

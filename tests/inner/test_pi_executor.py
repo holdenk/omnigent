@@ -7,6 +7,7 @@ import itertools
 import json
 import logging
 import os
+import random
 import shlex
 import shutil
 import socket
@@ -53,6 +54,7 @@ from omnigent.inner.pi_executor import (
     _split_pi_prompt,
     _ToolServer,
 )
+from omnigent.inner.rate_limit_retry import RateLimitRetryConfig
 from omnigent.models.model_catalog import ModelEntry
 from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
 from omnigent.onboarding.providers import ModelInfo
@@ -7541,3 +7543,316 @@ async def test_generic_catalog_discovery_does_not_block_runtime(
             beat.cancel()
             await asyncio.gather(beat, return_exceptions=True)
         await executor.close()
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit retry: a 429 before any output re-runs the turn with full jitter.
+# ---------------------------------------------------------------------------
+
+_CONCURRENCY_429 = (
+    'databricks-openai API error (429): {"code":"CONCURRENT_REQUEST_LIMIT_EXCEEDED",'
+    '"message":"Organization has reached its maximum number of concurrent requests."}'
+)
+
+
+class _HighRng(random.Random):
+    """Always draws the top of the jitter window."""
+
+    def uniform(self, a: float, b: float) -> float:
+        return b
+
+
+def _rate_limited_frames(error: str = _CONCURRENCY_429, *, pi_retries: bool = True) -> list[str]:
+    """pi's frames for a request rejected before any output; with *pi_retries*,
+    pi schedules its own retry and then reports it cancelled by ``abort_retry``."""
+    errored = _assistant_message(stop_reason="error", error_message=error)
+    frames = [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="agent_start"),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _rpc_frame(type="message_end", message=errored),
+        _rpc_frame(type="agent_end", messages=[errored], willRetry=pi_retries),
+    ]
+    if pi_retries:
+        frames += [
+            _rpc_frame(
+                type="auto_retry_start",
+                attempt=1,
+                maxAttempts=7,
+                delayMs=2000,
+                errorMessage=error,
+            ),
+            _rpc_frame(type="response", command="abort_retry", id="abort_retry", success=True),
+            _rpc_frame(
+                type="auto_retry_end", success=False, attempt=1, finalError="Retry cancelled"
+            ),
+        ]
+    return [*frames, _rpc_frame(type="agent_settled")]
+
+
+def _rate_limit_executor(
+    *attempt_frames: list[str],
+    config: RateLimitRetryConfig | None = None,
+    rng: random.Random | None = None,
+) -> tuple[PiExecutor, list[_PiRpcSession], list[_FakeStreamWriter]]:
+    """Executor whose every Pi spawn replays the next of *attempt_frames*.
+
+    :returns: ``(executor, rpcs, stdins)``; each stdin records the commands
+        sent to that attempt's process, kept after eviction closes it.
+    """
+    from omnigent.inner.pi_executor import _PiSessionState
+
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi_native.main.pi_version", return_value=_SETTLED_PI_VERSION),
+    ):
+        executor = PiExecutor(rate_limit_retry=config or RateLimitRetryConfig())
+    executor._rate_limit_rng = rng or random.Random(1234)
+    rpcs: list[_PiRpcSession] = []
+    stdins: list[_FakeStreamWriter] = []
+    for frames in attempt_frames:
+        rpc = _PiRpcSession()
+        rpc._line_queue = asyncio.Queue()
+        process = _FakeProcess()
+        rpc.process = process
+        rpc._stderr_lines = []
+        for line in frames:
+            rpc._line_queue.put_nowait(line)
+        rpcs.append(rpc)
+        stdins.append(process.stdin)
+    pending = list(rpcs)
+
+    async def fake_ensure_rpc(session_key, *args, **kwargs):
+        rpc = pending.pop(0)
+        executor._session_states[session_key] = _PiSessionState(
+            rpc=rpc, system_prompt="system", model=None
+        )
+        return rpc
+
+    executor._ensure_rpc = fake_ensure_rpc
+    return executor, rpcs, stdins
+
+
+def _commands(stdin: _FakeStreamWriter) -> list[str]:
+    return [json.loads(chunk.decode())["type"] for chunk in stdin.data]
+
+
+@pytest.fixture
+def backoff_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record rate-limit backoff delays instead of sleeping."""
+    delays: list[float] = []
+
+    async def fake_sleep(event: asyncio.Event, delay_s: float) -> bool:
+        delays.append(delay_s)
+        return False
+
+    monkeypatch.setattr("omnigent.inner.pi_executor._sleep_unless_set", fake_sleep)
+    return delays
+
+
+def test_rate_limit_retries_then_succeeds(
+    backoff_sleeps: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A concurrency 429 takes over pi's retry, waits a jittered delay, and
+    re-runs the turn on a fresh process that answers."""
+    executor, rpcs, stdins = _rate_limit_executor(
+        _rate_limited_frames(), _plain_answer_frames("RECOVERED")
+    )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.pi_executor"):
+        events = _run(_run_session_turn(executor, "hello"))
+
+    assert [type(e) for e in events] == [TextChunk, TurnComplete]
+    assert events[1].response == "RECOVERED"
+    assert _commands(stdins[0]) == ["prompt", "abort_retry"], "pi's own retry was not stopped"
+    assert _commands(stdins[1]) == ["prompt"]
+    assert rpcs[0].process is None, "the rate-limited process was kept"
+    assert executor._session_states[_SESSION_KEY].rpc is rpcs[1]
+    (delay,) = backoff_sleeps
+    assert 0.0 <= delay <= RateLimitRetryConfig().backoff_base_s
+    retry_logs = [r.getMessage() for r in caplog.records if "retry 1/" in r.getMessage()]
+    assert retry_logs == [
+        f"PiExecutor: rate limited (HTTP 429 CONCURRENT_REQUEST_LIMIT_EXCEEDED); "
+        f"retry 1/10 in {delay:.1f}s"
+    ]
+    assert not any("Organization" in r.getMessage() for r in caplog.records)
+
+
+def test_rate_limit_retry_without_pi_retry_still_retries(backoff_sleeps: list[float]) -> None:
+    """When pi does not retry (e.g. its retry is disabled) the executor still does."""
+    executor, _rpcs, stdins = _rate_limit_executor(
+        _rate_limited_frames(pi_retries=False), _plain_answer_frames("OK")
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [e.response for e in events if isinstance(e, TurnComplete)] == ["OK"]
+    assert _commands(stdins[0]) == ["prompt"]
+    assert len(backoff_sleeps) == 1
+
+
+def test_rate_limit_retry_honours_retry_after_hint(backoff_sleeps: list[float]) -> None:
+    """A server-requested wait is the minimum, with jitter added on top."""
+    error = 'gateway API error (429): {"code":"rate_limited","retry_after": 30}'
+    executor, _rpcs, _stdins = _rate_limit_executor(
+        _rate_limited_frames(error), _plain_answer_frames("OK"), rng=_HighRng()
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [e.response for e in events if isinstance(e, TurnComplete)] == ["OK"]
+    assert backoff_sleeps == [30.0 + RateLimitRetryConfig().backoff_base_s]
+
+
+def test_rate_limit_retry_jitter_stays_within_the_full_jitter_windows(
+    backoff_sleeps: list[float],
+) -> None:
+    config = RateLimitRetryConfig(max_retries=4, backoff_base_s=5.0, backoff_max_s=12.0)
+    executor, _rpcs, _stdins = _rate_limit_executor(
+        *[_rate_limited_frames() for _ in range(4)],
+        _plain_answer_frames("OK"),
+        config=config,
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [e.response for e in events if isinstance(e, TurnComplete)] == ["OK"]
+    windows = [5.0, 10.0, 12.0, 12.0]
+    assert len(backoff_sleeps) == len(windows)
+    for delay, window in zip(backoff_sleeps, windows, strict=True):
+        assert 0.0 <= delay <= window
+
+
+def test_rate_limit_retry_budget_exhaustion_surfaces_the_original_error(
+    backoff_sleeps: list[float],
+) -> None:
+    config = RateLimitRetryConfig(max_retries=2)
+    executor, rpcs, _stdins = _rate_limit_executor(
+        *[_rate_limited_frames() for _ in range(3)], config=config
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [type(e) for e in events] == [ExecutorError]
+    assert events[0].message == _CONCURRENCY_429
+    assert len(backoff_sleeps) == 2
+    assert all(rpc._line_queue.empty() for rpc in rpcs), "an attempt was skipped"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param('provider API error (402): {"message":"Out of credits"}', id="402"),
+        pytest.param('provider API error (400): {"message":"Invalid request"}', id="400"),
+    ],
+)
+def test_rate_limit_retry_does_not_retry_other_client_errors(
+    backoff_sleeps: list[float], error: str
+) -> None:
+    executor, rpcs, stdins = _rate_limit_executor(_rate_limited_frames(error, pi_retries=False))
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [e.message for e in events if isinstance(e, ExecutorError)] == [error]
+    assert backoff_sleeps == []
+    assert _commands(stdins[0]) == ["prompt"]
+    assert executor._session_states[_SESSION_KEY].rpc is rpcs[0], "the session was dropped"
+
+
+def test_rate_limit_retry_leaves_non_rate_limit_retries_to_pi(
+    backoff_sleeps: list[float],
+) -> None:
+    """pi keeps retrying other transient errors (e.g. a 503) itself."""
+    executor, _rpcs, stdins = _rate_limit_executor(_retry_recovery_frames("RECOVERED"))
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [e.response for e in events if isinstance(e, TurnComplete)] == ["RECOVERED"]
+    assert _commands(stdins[0]) == ["prompt"]
+    assert backoff_sleeps == []
+
+
+def test_rate_limit_after_streamed_output_is_not_re_run(backoff_sleeps: list[float]) -> None:
+    """Re-running would repeat what already streamed, so the error surfaces."""
+    partial = _assistant_message("partial ", stop_reason="error", error_message=_CONCURRENCY_429)
+    executor, _rpcs, stdins = _rate_limit_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(type="message_start", message={"role": "assistant"}),
+            _text_delta_frame("partial "),
+            _rpc_frame(type="message_end", message=partial),
+            _rpc_frame(type="agent_end", messages=[partial], willRetry=False),
+            _rpc_frame(type="agent_settled"),
+        ]
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [type(e) for e in events] == [TextChunk, ExecutorError]
+    assert events[1].message == _CONCURRENCY_429
+    assert backoff_sleeps == []
+    assert _commands(stdins[0]) == ["prompt"]
+
+
+def test_rate_limit_retry_disabled_with_zero_retries(backoff_sleeps: list[float]) -> None:
+    """``max_retries=0`` leaves the 429 to pi's own retry and surfaces it."""
+    executor, _rpcs, stdins = _rate_limit_executor(
+        _rate_limited_frames(), config=RateLimitRetryConfig(max_retries=0)
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [e.message for e in events if isinstance(e, ExecutorError)] == [_CONCURRENCY_429]
+    assert _commands(stdins[0]) == ["prompt"], "pi's own retry was cancelled"
+    assert backoff_sleeps == []
+
+
+async def _wait_for_backoff(executor: PiExecutor) -> None:
+    for _ in range(1000):
+        if _SESSION_KEY in executor._rate_limit_waits:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the turn never started its rate-limit backoff")
+
+
+def test_rate_limit_backoff_cancelled_task_stops_waiting() -> None:
+    """Cancelling the turn during an hour-long backoff ends it at once."""
+    config = RateLimitRetryConfig(budget_s=7200, backoff_base_s=3600, backoff_max_s=3600)
+    executor, _rpcs, _stdins = _rate_limit_executor(
+        _rate_limited_frames(), config=config, rng=_HighRng()
+    )
+
+    async def _test() -> None:
+        task = asyncio.create_task(_run_session_turn(executor, "hello"))
+        await _wait_for_backoff(executor)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert executor._rate_limit_waits == {}
+
+    _run(_test())
+
+
+@pytest.mark.parametrize("stop", ["interrupt_session", "close_session", "close"])
+def test_rate_limit_backoff_interrupt_or_close_ends_the_turn(stop: str) -> None:
+    """Interrupting or closing the session during a backoff ends the turn
+    without retrying."""
+    config = RateLimitRetryConfig(budget_s=7200, backoff_base_s=3600, backoff_max_s=3600)
+    executor, _rpcs, _stdins = _rate_limit_executor(
+        _rate_limited_frames(), config=config, rng=_HighRng()
+    )
+
+    async def _test() -> None:
+        task = asyncio.create_task(_run_session_turn(executor, "hello"))
+        await _wait_for_backoff(executor)
+        if stop == "interrupt_session":
+            assert await executor.interrupt_session(_SESSION_KEY) is True
+        elif stop == "close_session":
+            await executor.close_session(_SESSION_KEY)
+        else:
+            await executor.close()
+        events = await asyncio.wait_for(task, timeout=5)
+        assert events == []
+        assert executor._rate_limit_waits == {}
+
+    _run(_test())

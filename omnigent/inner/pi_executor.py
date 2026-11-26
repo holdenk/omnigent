@@ -43,6 +43,7 @@ import logging
 import math
 import os
 import pathlib
+import random
 import re
 import secrets
 import shlex
@@ -68,6 +69,11 @@ from omnigent.harnesses.pi_native.credentials import (
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.inner.pi_settings import PI_CONTEXT_FILE_NAMES
+from omnigent.inner.rate_limit_retry import (
+    RateLimitBackoff,
+    RateLimitRetryConfig,
+    classify_rate_limit,
+)
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
 from omnigent.models.model_metadata import ModelWireAPI
@@ -1493,6 +1499,29 @@ class _PiSessionState:
     abort_requested: bool = False
 
 
+@dataclass
+class _PiTurnAttempt:
+    """Rate-limit retry bookkeeping for one prompt sent to Pi.
+
+    :param progressed: An event already reached the consumer, so re-running
+        the prompt would repeat streamed text or tool calls.
+    :param pi_retry_owned: Pi's own automatic retry handled the latest
+        failure, so retrying the turn as well would multiply attempts.
+    """
+
+    progressed: bool = False
+    pi_retry_owned: bool = False
+
+
+async def _sleep_unless_set(event: asyncio.Event, delay_s: float) -> bool:
+    """Wait up to *delay_s* seconds; return whether *event* was set first."""
+    try:
+        await asyncio.wait_for(event.wait(), timeout=delay_s)
+    except TimeoutError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class BlockedCheck:
     """Result of inspecting a Pi tool result for a policy-blocked payload.
@@ -2182,6 +2211,7 @@ class PiExecutor(Executor):
         gateway_auth_command: str | None = None,
         gateway_auth_refresh_interval_ms: str | None = None,
         retry_policy: RetryPolicy | None = None,
+        rate_limit_retry: RateLimitRetryConfig | None = None,
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
@@ -2243,6 +2273,10 @@ class PiExecutor(Executor):
             backoff and Retry-After honoring; this just sets the
             budget. ``None`` resolves to ``RetryPolicy()`` defaults.
             See Phase 1f of ``designs/RETRY_ACROSS_HARNESSES.md``.
+        :param rate_limit_retry: Budget for re-running a turn that fails with
+            a provider rate limit (HTTP 429) before it streamed anything. Pi's
+            own retry has no jitter, so the executor owns these retries.
+            ``None`` reads ``OMNIGENT_PI_RATE_LIMIT_*`` from the environment.
         :param bundle_dir: The agent bundle's extracted on-disk path.
             When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` and
             ``<bundle_dir>/.pi/skills/<dir>/SKILL.md`` files are exposed
@@ -2305,6 +2339,15 @@ class PiExecutor(Executor):
         # does exponential backoff + Retry-After honoring; we just set
         # the budget.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        self._rate_limit_retry = (
+            rate_limit_retry
+            if rate_limit_retry is not None
+            else RateLimitRetryConfig.from_env(os.environ)
+        )
+        # ``None`` uses the module RNG; tests install a seeded ``random.Random``.
+        self._rate_limit_rng: random.Random | None = None
+        # Set by :meth:`interrupt_session` to end a rate-limit backoff early.
+        self._rate_limit_waits: dict[str, asyncio.Event] = {}
         # Allowlisted base env for the Pi subprocess — never the full
         # host environ. The spec's os_env.sandbox.env_passthrough is the
         # opt-in for anything beyond the base set (e.g. a provider API
@@ -2449,6 +2492,8 @@ class PiExecutor(Executor):
             return False
 
     async def close_session(self, session_key: str) -> None:
+        if (wait := self._rate_limit_waits.get(session_key)) is not None:
+            wait.set()
         state = self._session_states.pop(session_key, None)
         if state is not None and state.rpc is not None:
             await state.rpc.close()
@@ -2464,6 +2509,10 @@ class PiExecutor(Executor):
             logger.debug("PiExecutor: evicting the RPC session failed: %s", exc)
 
     async def interrupt_session(self, session_key: str) -> bool:
+        if (wait := self._rate_limit_waits.get(session_key)) is not None:
+            # No Pi run is active during a rate-limit backoff; end the wait instead.
+            wait.set()
+            return True
         state = self._session_states.get(session_key)
         if state is None or state.rpc is None:
             return False
@@ -2485,6 +2534,8 @@ class PiExecutor(Executor):
             return False
 
     async def close(self) -> None:
+        for wait in self._rate_limit_waits.values():
+            wait.set()
         keys = list(self._session_states.keys())
         for key in keys:
             await self.close_session(key)
@@ -3114,6 +3165,79 @@ class PiExecutor(Executor):
         system_prompt: str,
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
+        """Run one turn, re-running it after a rate limit that streamed nothing.
+
+        Pi's own retry waits a fixed schedule with no jitter and ignores
+        ``Retry-After``, so sessions rejected together by a gateway concurrency
+        cap retry together. Rate limits before any output are re-run here with
+        full jitter instead; once the budget is spent the last error is
+        surfaced unchanged.
+        """
+        session_key = self._session_key(messages)
+        backoff: RateLimitBackoff | None = None
+        while True:
+            attempt = _PiTurnAttempt()
+            failure: ExecutorError | None = None
+            async for event in self._run_turn_attempt(
+                messages, tools, system_prompt, config, attempt
+            ):
+                if isinstance(event, ExecutorError) and not attempt.progressed:
+                    failure = event
+                    continue
+                attempt.progressed = True
+                yield event
+            if failure is None:
+                return
+            rate_limit = None
+            if self._rate_limit_retry.max_retries > 0 and not attempt.pi_retry_owned:
+                rate_limit = classify_rate_limit(failure.message)
+            if rate_limit is None:
+                yield failure
+                return
+            if backoff is None:
+                backoff = RateLimitBackoff(self._rate_limit_retry, rng=self._rate_limit_rng)
+            delay_s = backoff.next_delay(rate_limit)
+            if delay_s is None:
+                logger.info(
+                    "PiExecutor: rate limited (%s); retry budget spent after %d retries",
+                    rate_limit.reason,
+                    backoff.retries,
+                )
+                yield failure
+                return
+            logger.info(
+                "PiExecutor: rate limited (%s); retry %d/%d in %.1fs",
+                rate_limit.reason,
+                backoff.retries,
+                self._rate_limit_retry.max_retries,
+                delay_s,
+            )
+            # A fresh process replays the history, so the prompt is not duplicated.
+            state = self._session_states.get(session_key)
+            if state is not None and state.rpc is not None:
+                await self._evict_rpc(session_key, state.rpc)
+            if not await self._wait_for_rate_limit_retry(session_key, delay_s):
+                return
+
+    async def _wait_for_rate_limit_retry(self, session_key: str, delay_s: float) -> bool:
+        """Sleep before a rate-limit retry; ``False`` when the session was interrupted."""
+        interrupted = asyncio.Event()
+        self._rate_limit_waits[session_key] = interrupted
+        try:
+            return not await _sleep_unless_set(interrupted, delay_s)
+        finally:
+            if self._rate_limit_waits.get(session_key) is interrupted:
+                del self._rate_limit_waits[session_key]
+
+    async def _run_turn_attempt(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None,
+        attempt: _PiTurnAttempt,
+    ) -> AsyncIterator[ExecutorEvent]:
+        """Send the turn's prompt to Pi once and translate its events."""
         model = await self._resolve_model(config)
         if self._uses_gateway(model):
             try:
@@ -3515,6 +3639,7 @@ class PiExecutor(Executor):
                     elif stop is not None:
                         # A later completed assistant message means pi recovered.
                         pending_error = None
+                        attempt.pi_retry_owned = False
                 continue
 
             if event_type == "compaction_end" and settled_boundary:
@@ -3537,6 +3662,29 @@ class PiExecutor(Executor):
                         )
                     )
                     return
+                continue
+
+            if event_type == "auto_retry_start":
+                error_message = event.get("errorMessage")
+                rate_limit = (
+                    classify_rate_limit(error_message)
+                    if isinstance(error_message, str) and self._rate_limit_retry.max_retries > 0
+                    else None
+                )
+                if rate_limit is None or attempt.progressed:
+                    attempt.pi_retry_owned = True
+                    continue
+                # The turn has shown nothing yet, so run_turn retries it with
+                # jitter; stop Pi's fixed-schedule retry of the same failure.
+                logger.info(
+                    "PiExecutor: rate limited (%s); cancelling Pi's retry", rate_limit.reason
+                )
+                attempt.pi_retry_owned = False
+                try:
+                    await rpc.send_command({"type": "abort_retry", "id": "abort_retry"})
+                except Exception as exc:  # noqa: BLE001 — Pi then retries on its own schedule
+                    logger.debug("PiExecutor: abort_retry failed: %s", exc)
+                    attempt.pi_retry_owned = True
                 continue
 
             if event_type == "extension_ui_request":
